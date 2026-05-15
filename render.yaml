@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: telegram-encryption-bot
+    name: tg-large-file-encrypt-bot
     runtime: python
     repo: https://github.com/kingali371/tg-large-file-encrypt-bot
     plan: free
