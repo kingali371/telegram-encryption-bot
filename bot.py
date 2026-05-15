@@ -5,38 +5,33 @@ Telegram Encryption Bot - بوت تقسيم وتشفير الملفات الكب
 """
 
 import os
-import base64
+import sys
 import hashlib
-import logging
+import base64
 import tempfile
-import json
-from typing import Dict, Tuple, Optional, List
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2KeyDerivationFunction
-from cryptography.hazmat.primitives import hashes
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+import logging
+from typing import List, Dict, Tuple, Optional
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
+from cryptography.fernet import Fernet
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-# ابحث عن أي مكان في الكود يستخدم PBKDF2 أو PBKDF2KeyDerivationFunction
-# واستبدله بـ PBKDF2HMAC مع التأكد من تمرير المعاملات الصحيحة
-
-# إعدادات
+# إعدادات التسجيل
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# المتغيرات البيئية
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 OWNER_ID = int(os.environ.get('OWNER_ID', 0))
 PORT = int(os.environ.get('PORT', 8080))
 
 # إعدادات التقسيم
-MAX_PART_SIZE = 19 * 1024 * 1024  # 19 ميجابايت (لضمان عدم تجاوز حد التليجرام 20 ميجابايت)
-CHUNK_SIZE = 1024 * 1024  # 1 ميجابايت للقراءة التدريجية
+MAX_PART_SIZE = 19 * 1024 * 1024  # 19 ميجابايت
+CHUNK_SIZE = 1024 * 1024  # 1 ميجابايت
 
 
 class FileSplitter:
@@ -44,16 +39,7 @@ class FileSplitter:
     
     @staticmethod
     def split_file(file_data: bytes, part_size: int = MAX_PART_SIZE) -> List[bytes]:
-        """
-        تقسيم الملف إلى أجزاء متساوية
-        
-        Args:
-            file_data: بيانات الملف
-            part_size: حجم كل جزء بالبايت
-        
-        Returns:
-            قائمة بالأجزاء
-        """
+        """تقسيم الملف إلى أجزاء"""
         parts = []
         total_size = len(file_data)
         num_parts = (total_size + part_size - 1) // part_size
@@ -70,31 +56,12 @@ class FileSplitter:
     
     @staticmethod
     def merge_parts(parts: List[bytes]) -> bytes:
-        """
-        دمج الأجزاء إلى ملف واحد
-        
-        Args:
-            parts: قائمة الأجزاء
-        
-        Returns:
-            الملف المدمج
-        """
+        """دمج الأجزاء إلى ملف واحد"""
         return b''.join(parts)
     
     @staticmethod
     def create_metadata(original_name: str, total_parts: int, part_size: int, file_hash: str) -> dict:
-        """
-        إنشاء ملف metadata للملف المقسم
-        
-        Args:
-            original_name: اسم الملف الأصلي
-            total_parts: عدد الأجزاء
-            part_size: حجم كل جزء
-            file_hash: هاش الملف الأصلي للتحقق
-        
-        Returns:
-            قاموس metadata
-        """
+        """إنشاء ملف metadata للملف المقسم"""
         return {
             "original_name": original_name,
             "total_parts": total_parts,
@@ -120,7 +87,7 @@ class EncryptionBot:
         if salt is None:
             salt = os.urandom(16)
         
-        kdf = PBKDF2(
+        kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
@@ -132,6 +99,15 @@ class EncryptionBot:
     def calculate_file_hash(self, file_data: bytes) -> str:
         """حساب هاش SHA256 للملف"""
         return hashlib.sha256(file_data).hexdigest()
+    
+    def hash_text(self, text: str, algorithm: str = 'sha256') -> str:
+        """توليد هاش للنص"""
+        if algorithm == 'sha256':
+            return hashlib.sha256(text.encode()).hexdigest()
+        elif algorithm == 'md5':
+            return hashlib.md5(text.encode()).hexdigest()
+        else:
+            return hashlib.sha256(text.encode()).hexdigest()
     
     def encrypt_data(self, data: bytes, password: str) -> bytes:
         """تشفير البيانات"""
@@ -152,12 +128,12 @@ class EncryptionBot:
             logger.error(f"فشل فك التشفير: {e}")
             return None
     
-    def encrypt_and_split_file(self, file_data: bytes, password: str) -> Tuple[List[bytes], dict]:
+    def encrypt_and_split_file(self, file_data: bytes, password: str, original_name: str) -> Tuple[List[bytes], List[str], dict]:
         """
         تشفير الملف ثم تقسيمه إلى أجزاء
         
         Returns:
-            (قائمة الأجزاء المشفرة, metadata)
+            (قائمة الأجزاء المشفرة, قائمة أسماء الأجزاء, metadata)
         """
         # 1. حساب هاش الملف الأصلي
         file_hash = self.calculate_file_hash(file_data)
@@ -168,15 +144,21 @@ class EncryptionBot:
         # 3. تقسيم الملف المشفر
         parts = self.splitter.split_file(encrypted_data)
         
-        # 4. إنشاء metadata
+        # 4. إنشاء أسماء للأجزاء
+        part_names = []
+        for i in range(len(parts)):
+            part_name = f"{original_name}.part{i+1:03d}.encrypted"
+            part_names.append(part_name)
+        
+        # 5. إنشاء metadata
         metadata = self.splitter.create_metadata(
-            original_name="encrypted_file",
+            original_name=original_name,
             total_parts=len(parts),
             part_size=MAX_PART_SIZE,
             file_hash=file_hash
         )
         
-        return parts, metadata
+        return parts, part_names, metadata
     
     def merge_and_decrypt_parts(self, parts: List[bytes], password: str) -> Optional[bytes]:
         """
@@ -212,9 +194,11 @@ class EncryptionBot:
             return None
     
     def encode_base64(self, text: str) -> str:
+        """تحويل إلى Base64"""
         return base64.b64encode(text.encode()).decode()
     
     def decode_base64(self, encoded: str) -> Optional[str]:
+        """فك Base64"""
         try:
             return base64.b64decode(encoded).decode()
         except Exception:
@@ -277,7 +261,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """عرض المساعدة التفصيلية"""
-    help_text = """
+    user_id = update.effective_user.id
+    if not encryption_bot.is_authorized(user_id):
+        await update.message.reply_text("❌ غير مصرح لك.")
+        return
+    
+    help_text = f"""
 📖 **دليل الاستخدام التفصيلي:**
 
 📁 **تشفير وتقسيم ملف كبير:**
@@ -294,8 +283,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 1. أرسل جميع الأجزاء التي تريد دمجها (يمكن إرسالها دفعة واحدة)
 2. سيتعرف البوت تلقائياً على الأجزاء
-3. أدخل كلمة المرور
-4. استلم الملف الأصلي المفكك
+3. أرسل `/done` بعد إرسال جميع الأجزاء
+4. أدخل كلمة المرور
+5. استلم الملف الأصلي المفكك
 
 📝 **تشفير النصوص:**
 
@@ -313,10 +303,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 • احتفظ بكلمة المرور بأمان - بدونها لا يمكن استعادة الملف!
 • يجب إرسال جميع الأجزاء لفك التشفير
-• الأجزاء مرقمة تلقائياً (part1, part2, ...)
+• الأجزاء مرقمة تلقائياً (part001, part002, ...)
 
-👤 **ايدي المالك:** `{}
-    """.format(OWNER_ID)
+👤 **ايدي المالك:** `{OWNER_ID}`
+    """
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
 
@@ -472,7 +462,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif action == 'hash_waiting':
         algo = context.user_data.get('hash_algo', 'sha256')
-        result = encryption_bot.hash_text(text, algo) if hasattr(encryption_bot, 'hash_text') else None
+        result = encryption_bot.hash_text(text, algo)
         if result:
             await update.message.reply_text(
                 f"✅ **{algo.upper()}:**\n`{result}`",
@@ -483,50 +473,110 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif context.user_data.get('file_action') == 'waiting_password':
         # معالجة كلمة المرور للملفات
         password = text
+        file_data = context.user_data.get('file_data')
+        file_name = context.user_data.get('file_name')
         file_parts = context.user_data.get('file_parts', [])
-        temp_files = context.user_data.get('temp_files', [])
         
-        await update.message.reply_text("🔓 **جاري دمج وفك تشفير الملف...**", parse_mode='Markdown')
-        
-        try:
-            # دمج وفك تشفير الأجزاء
-            result_data = encryption_bot.merge_and_decrypt_parts(file_parts, password)
+        if file_data:
+            # تشفير وتقسيم ملف جديد
+            await update.message.reply_text("🔒 **جاري تشفير وتقسيم الملف...**", parse_mode='Markdown')
             
-            if result_data:
-                # إرسال الملف المفكك
-                original_name = context.user_data.get('original_name', 'decrypted_file')
+            try:
+                # تشفير وتقسيم الملف
+                parts, part_names, metadata = encryption_bot.encrypt_and_split_file(
+                    file_data, password, file_name
+                )
                 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(original_name)[1]) as tmp:
-                    tmp.write(result_data)
-                    tmp_path = tmp.name
+                # إرسال metadata أولاً
+                metadata_text = f"📋 **معلومات الملف المشفر:**\n\n"
+                metadata_text += f"📄 الاسم الأصلي: `{metadata['original_name']}`\n"
+                metadata_text += f"🔢 عدد الأجزاء: {metadata['total_parts']}\n"
+                metadata_text += f"🔐 هاش الملف: `{metadata['file_hash'][:16]}...`\n"
                 
-                with open(tmp_path, 'rb') as f:
-                    await update.message.reply_document(
-                        document=f,
-                        filename=original_name,
-                        caption=f"✅ **تم دمج وفك التشفير بنجاح!**\n\n"
-                               f"📦 الحجم: {len(result_data) / (1024*1024):.2f} ميجابايت"
-                    )
+                await update.message.reply_text(metadata_text, parse_mode='Markdown')
                 
-                os.unlink(tmp_path)
-                await update.message.reply_text("🎉 **اكتملت العملية بنجاح!**", parse_mode='Markdown')
-            else:
+                # إرسال الأجزاء
+                for i, (part_data, part_name) in enumerate(zip(parts, part_names), 1):
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.encrypted') as tmp:
+                        tmp.write(part_data)
+                        tmp_path = tmp.name
+                    
+                    with open(tmp_path, 'rb') as f:
+                        await update.message.reply_document(
+                            document=f,
+                            filename=part_name,
+                            caption=f"📦 الجزء {i}/{len(parts)} - {len(part_data) / (1024*1024):.2f} ميجابايت"
+                        )
+                    
+                    os.unlink(tmp_path)
+                    
+                    # تأخير بسيط بين الإرسال لتجنب القيود
+                    await asyncio.sleep(0.5)
+                
                 await update.message.reply_text(
-                    "❌ **فشل فك التشفير!**\n\n"
-                    "🔍 الأسباب المحتملة:\n"
-                    "• كلمة المرور غير صحيحة\n"
-                    "• الأجزاء غير مكتملة أو تالفة",
+                    f"✅ **اكتمل التشفير والتقسيم بنجاح!**\n\n"
+                    f"📦 {len(parts)} جزء\n"
+                    f"🔐 كلمة المرور: `{password}`\n\n"
+                    f"⚠️ احتفظ بكلمة المرور بأمان!",
                     parse_mode='Markdown'
                 )
-        except Exception as e:
-            await update.message.reply_text(f"❌ خطأ: {e}")
-        finally:
-            # تنظيف الملفات المؤقتة
-            for tmp_path in temp_files:
-                try:
+            except Exception as e:
+                await update.message.reply_text(f"❌ خطأ أثناء التشفير: {e}")
+            finally:
+                context.user_data.clear()
+        
+        elif file_parts:
+            # دمج وفك تشفير أجزاء موجودة
+            await update.message.reply_text("🔓 **جاري دمج وفك تشفير الملف...**", parse_mode='Markdown')
+            
+            try:
+                # دمج وفك تشفير الأجزاء
+                result_data = encryption_bot.merge_and_decrypt_parts(file_parts, password)
+                
+                if result_data:
+                    # إرسال الملف المفكك
+                    original_name = context.user_data.get('original_name', 'decrypted_file')
+                    
+                    # تحديد الامتداد الأصلي
+                    if '.' in original_name:
+                        ext = original_name.split('.')[-1]
+                        temp_suffix = f'.{ext}'
+                    else:
+                        temp_suffix = ''
+                    
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=temp_suffix) as tmp:
+                        tmp.write(result_data)
+                        tmp_path = tmp.name
+                    
+                    # إعادة بناء الاسم الأصلي
+                    output_name = os.path.basename(original_name)
+                    if output_name.endswith('.encrypted'):
+                        output_name = output_name[:-9]
+                    
+                    with open(tmp_path, 'rb') as f:
+                        await update.message.reply_document(
+                            document=f,
+                            filename=output_name,
+                            caption=f"✅ **تم دمج وفك التشفير بنجاح!**\n\n"
+                                   f"📦 الحجم: {len(result_data) / (1024*1024):.2f} ميجابايت"
+                        )
+                    
                     os.unlink(tmp_path)
-                except:
-                    pass
+                    await update.message.reply_text("🎉 **اكتملت العملية بنجاح!**", parse_mode='Markdown')
+                else:
+                    await update.message.reply_text(
+                        "❌ **فشل فك التشفير!**\n\n"
+                        "🔍 الأسباب المحتملة:\n"
+                        "• كلمة المرور غير صحيحة\n"
+                        "• الأجزاء غير مكتملة أو تالفة",
+                        parse_mode='Markdown'
+                    )
+            except Exception as e:
+                await update.message.reply_text(f"❌ خطأ أثناء فك التشفير: {e}")
+            finally:
+                context.user_data.clear()
+        else:
+            await update.message.reply_text("❌ خطأ: لم يتم العثور على بيانات الملف!")
             context.user_data.clear()
     
     else:
@@ -552,12 +602,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if '.part' in file_name and file_name.endswith('.encrypted'):
         # تجميع الأجزاء
         parts_list = context.user_data.get('pending_parts', [])
-        parts_list.append({
-            'name': file_name,
-            'data': None,
-            'size': file_size
-        })
-        context.user_data['pending_parts'] = parts_list
         
         # تحميل الملف الحالي
         status_msg = await update.message.reply_text(
@@ -570,7 +614,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # تحميل البيانات
         file = await document.get_file()
         file_data = await file.download_as_bytearray()
-        parts_list[-1]['data'] = bytes(file_data)
+        
+        parts_list.append({
+            'name': file_name,
+            'data': bytes(file_data),
+            'size': file_size
+        })
+        context.user_data['pending_parts'] = parts_list
         
         await status_msg.edit_text(
             f"✅ **تم حفظ الجزء:** `{file_name}`\n"
@@ -595,7 +645,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         context.user_data['file_action'] = 'waiting_password'
         context.user_data['file_parts'] = [bytes(file_data)]
-        context.user_data['original_name'] = file_name.replace('.encrypted', '')
+        context.user_data['original_name'] = file_name
         
         await status_msg.delete()
         await update.message.reply_text(
@@ -661,12 +711,14 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     context.user_data['file_action'] = 'waiting_password'
     context.user_data['file_parts'] = file_parts
-    context.user_data['temp_files'] = []
     
     # استخراج الاسم الأصلي
     first_part_name = pending_parts[0]['name']
     original_name = first_part_name.split('.part')[0].replace('.encrypted', '')
     context.user_data['original_name'] = original_name
+    
+    # تنظيف قائمة الأجزاء المؤقتة
+    context.user_data.pop('pending_parts', None)
     
     await update.message.reply_text(
         f"✅ **تم تجميع {len(pending_parts)} أجزاء بنجاح!**\n\n"
@@ -686,9 +738,46 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معلومات عن البوت"""
+    user_id = update.effective_user.id
+    if not encryption_bot.is_authorized(user_id):
+        await update.message.reply_text("❌ غير مصرح لك.")
+        return
+    
+    about_text = """
+🤖 **بوت تشفير الملفات المتقدم**
+
+**الإصدار:** 4.0
+**المطور:** @your_username
+
+**التقنيات المستخدمة:**
+• Python 3.10+
+• python-telegram-bot v20+
+• Cryptography (AES-256)
+• Fernet Encryption
+
+**المميزات:**
+✅ تشفير AES-256
+✅ تقسيم الملفات الكبيرة
+✅ دعم الملفات حتى 500 ميجابايت
+✅ تشفير النصوص
+✅ Base64 encoding/decoding
+✅ SHA256/MD5 hashing
+
+**الخصوصية:**
+• جميع العمليات تتم محلياً
+• لا يتم تخزين أي ملفات أو كلمات مرور
+• التشفير من طرف إلى طرف
+
+💡 **للاقتراحات والدعم:** تواصل مع المطور
+    """
+    await update.message.reply_text(about_text, parse_mode='Markdown')
+
+
 # ============= التشغيل ============= #
 
-def main():
+async def main():
     """تشغيل البوت"""
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN غير موجود!")
@@ -711,6 +800,7 @@ def main():
     app.add_handler(CommandHandler("hash", hash_command))
     app.add_handler(CommandHandler("done", done_command))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("about", about))
     
     # معالجة الأزرار
     app.add_handler(CallbackQueryHandler(button_handler))
@@ -723,13 +813,18 @@ def main():
     logger.info(f"👤 المالك ID: {OWNER_ID}")
     logger.info(f"📦 الحد الأقصى لكل جزء: {MAX_PART_SIZE // (1024*1024)} ميجابايت")
     
-    # تشغيل البوت مع webhook
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'localhost')}/webhook"
-    )
+    # تشغيل البوت مع webhook لـ Render
+    if os.environ.get('RENDER_EXTERNAL_HOSTNAME'):
+        await app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/webhook"
+        )
+    else:
+        # تشغيل محلي مع polling
+        await app.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
